@@ -4,6 +4,7 @@ const Transaction = require('../models/Transaction');
 const User = require('../models/User');
 const Merchant = require('../models/Merchant');
 const authenticateToken = require('../middleware/auth');
+const { body, validationResult } = require('express-validator');
 
 
 
@@ -144,53 +145,106 @@ router.post('/transfer',authenticateToken, async (req, res) => {
 });
 
 // Payment route
-router.post('/pay',authenticateToken, async (req, res) => {
-  try {
-    const { amount, currency, merchantId } = req.body;
-    const userId = req.user._id;
 
-    const user = await User.findById(userId);
-    const merchant = await Merchant.findById(merchantId);
+const validatePaymentRequest = [
+  body('merchantId').notEmpty().isMongoId(),
+  body('amount').isFloat({ min: 0.01 }),
+  body('currency').isIn(['SMART_PAY', 'LOCAL'])
+];
 
-    if (!user || !merchant) {
-      return res.status(404).json({ msg: 'User or merchant not found' });
+router.post('/pay', 
+  authenticateToken,
+  validatePaymentRequest,
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ 
+        msg: 'Invalid input',
+        errors: errors.array() 
+      });
     }
 
-    const userBalance = currency === 'SMART_PAY' ? user.smartPayBalance : user.localCurrencyBalance;
-    if (userBalance < amount) {
-      return res.status(400).json({ msg: 'Insufficient funds' });
+    // Start a transaction session
+    const session = await startSession();
+    session.startTransaction();
+
+    try {
+      const { amount, currency, merchantId } = req.body;
+      const userId = req.user._id;
+
+      // Fetch user and merchant in parallel
+      const [user, merchant] = await Promise.all([
+        User.findById(userId).session(session),
+        Merchant.findById(merchantId).session(session)
+      ]);
+
+      if (!user) {
+        throw new Error('User not found');
+      }
+      if (!merchant) {
+        throw new Error('Merchant not found');
+      }
+
+      // Determine which balance to use
+      const balanceField = currency === 'SMART_PAY' ? 'smartPayBalance' : 'localCurrencyBalance';
+      
+      if (user[balanceField] < amount) {
+        throw new Error('Insufficient funds');
+      }
+
+      // Create transaction record
+      const transaction = new Transaction({
+        transactionType: 'PAYMENT',
+        sender: userId,
+        senderType: 'User',
+        receiver: merchantId,
+        receiverType: 'Merchant',
+        amount,
+        currency,
+        status: 'COMPLETED',
+        timestamp: new Date()
+      });
+
+      // Update balances
+      user[balanceField] -= amount;
+      merchant[balanceField] += amount;
+
+      // Save all changes in parallel
+      await Promise.all([
+        transaction.save({ session }),
+        user.save(),
+        merchant.save()
+      ]);
+
+      // Commit the transaction
+      await session.commitTransaction();
+
+      // Send success response
+      res.json({ 
+        msg: 'Payment successful',
+        transactionId: transaction._id,
+        newBalance: user[balanceField]
+      });
+
+    } catch (error) {
+      // Rollback transaction on error
+      await session.abortTransaction();
+
+      // Handle specific errors
+      if (error.message === 'Insufficient funds') {
+        return res.status(400).json({ msg: error.message });
+      }
+      if (error.message === 'User not found' || error.message === 'Merchant not found') {
+        return res.status(404).json({ msg: error.message });
+      }
+
+      // Log unexpected errors
+      console.error('Payment error:', error);
+      res.status(500).json({ msg: 'Server error' });
+    } finally {
+      session.endSession();
     }
-
-    const transaction = new Transaction({
-      transactionType: 'PAYMENT',
-      sender: userId,
-      senderType: 'User',
-      receiver: merchantId,
-      receiverType: 'Merchant',
-      amount,
-      currency
-    });
-
-    await transaction.save();
-
-    if (currency === 'SMART_PAY') {
-      user.smartPayBalance -= amount;
-      merchant.smartPayBalance += amount;
-    } else {
-      user.localCurrencyBalance -= amount;
-      merchant.localCurrencyBalance += amount;
-    }
-
-    await user.save();
-    await merchant.save();
-
-    res.json({ msg: 'Payment successful' });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ msg: 'Server error' });
-  }
 });
-
 // Get balance route
 router.get('/balance',authenticateToken, async (req, res) => {
   try {
